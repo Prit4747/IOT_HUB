@@ -38,6 +38,12 @@ extern "C" {
 #define PPP_TEST_HOST               "example.com"
 #define PPP_TEST_PORT               80
 
+/* Applied to the PPP netif in ppp_manager.c's apply_got_ip() -- see the
+ * comment there for why (HTTPS OTA connect failures over cellular PPP
+ * that plain HTTP didn't hit, traced to MTU). 1400 is conservative;
+ * lower further (1350/1300) if HTTPS connects are still unreliable. */
+#define PPP_MTU                     1400
+
 #define RETRY_BASE_DELAY_MS         3000
 #define RETRY_MAX_DELAY_MS          60000
 

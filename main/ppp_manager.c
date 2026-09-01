@@ -37,6 +37,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
+#include "esp_netif_net_stack.h"
+#include "lwip/netif.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -66,6 +68,38 @@ static bool netif_has_v4(esp_netif_t *nif)
 static void apply_got_ip(esp_netif_t *nif, const esp_netif_ip_info_t *ip_info)
 {
     ESP_LOGI(TAG, "PPP GOT_IP  " IPSTR, IP2STR(&ip_info->ip));
+
+    /* Lower the netif MTU below lwIP's 1500-byte default. Observed in
+     * practice (2026-09-01, HTTPS OTA against GitHub over this exact PPP
+     * link): plain HTTP TCP connects succeeded fine, but every HTTPS
+     * connect attempt failed at the TLS handshake stage with
+     * "delayed connect error: Software caused connection abort" --
+     * before any application data was exchanged. TLS handshakes push
+     * noticeably larger packets than a small HTTP GET (ClientHello with
+     * SNI/cert-bundle extensions, a multi-KB ServerHello+certificate
+     * chain), and cellular PPP paths often silently drop/abort packets
+     * above some carrier-specific size well under the standard 1500 --
+     * this is a well-known PPPoS-over-cellular gotcha, not specific to
+     * one modem or backend, hence fixed here rather than per-backend.
+     * 1400 is a conservative, commonly-used value that leaves headroom
+     * under most carriers' actual path MTU. If OTA connects are still
+     * flaky after this, try lowering further (e.g. 1350/1300) before
+     * suspecting anything else.
+     *
+     * No public esp_netif_set_mtu() exists in this IDF version (checked
+     * esp_netif.h directly -- not there), so this goes through
+     * esp_netif_get_netif_impl(), which for the lwIP port returns the
+     * underlying lwIP `struct netif *` -- its `mtu` field is directly
+     * settable and takes effect immediately for future sends. This works
+     * identically regardless of which backend created the netif (esp_modem
+     * for UART, iot_usbh_modem internally for USB), since it operates on
+     * the netif handle itself, not on how it was constructed. */
+    struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(nif);
+    if (lwip_nif) {
+        lwip_nif->mtu = PPP_MTU;
+    } else {
+        ESP_LOGW(TAG, "esp_netif_get_netif_impl returned NULL -- MTU not changed");
+    }
 
     /* Always force a known-good public resolver -- see file-header note. */
     esp_netif_dns_info_t dns_main = {0};
