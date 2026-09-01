@@ -1,0 +1,117 @@
+menu "IoT Hub Multi-Modem Configuration"
+
+    choice MODEM_MODULE
+        prompt "Modem module"
+        default MODEM_MODULE_SIMCOM_A7672_USB
+        help
+            Selects which physical modem + transport this firmware targets.
+            Only the backend source file for the selected module is compiled
+            in (see main/CMakeLists.txt, wired in a later step) -- an
+            unselected backend's dependencies (e.g. iot_usbh_modem vs
+            esp_modem) are not even pulled into the build.
+
+            Changing this option requires a full rebuild, not just a
+            reflash, AND requires the physical hardware to already be wired
+            for that transport (USB D+/D-/GND vs UART Tx/Rx/GND) -- the two
+            are not interchangeable on the same wiring.
+
+        config MODEM_MODULE_SIMCOM_A7672_USB
+            bool "SimCom A7672S -- USB host (proven)"
+            help
+                ESP32-S3 as USB host, talking to the A7672S over
+                iot_usbh_modem (USB-CDC PPP). Matches VID 0x1E0E / PID
+                0x9011, modem interface 5. This is the original, most
+                thoroughly proven path of the three.
+
+        config MODEM_MODULE_QUECTEL_EC200U_UART
+            bool "Quectel EC200U-CN -- UART PPPoS (proven)"
+            help
+                Vanix TracX-1b carrier's UART header wired directly to an
+                ESP32-S3 UART, using esp_modem's generic DCE profile (the
+                EC200U-CN isn't one of esp_modem's named devices, but is
+                3GPP TS 27.007-compliant). Deliberately not USB -- see the
+                original Quectel_EC200U project's README for why.
+
+        config MODEM_MODULE_QUECTEL_EC200U_USB
+            bool "Quectel EC200U-CN -- USB host (EXPERIMENTAL -- placeholder PID)"
+            help
+                Same iot_usbh_modem USB-host approach as the SimCom backend,
+                but for the Quectel EC200U-CN. The module's real USB
+                PID/interface number is NOT confirmed (the datasheet gives
+                no VID/PID table) -- this backend ships with a placeholder
+                match entry and is expected to fail usbh_modem_install()
+                until the real values are read off the device-connect log
+                and filled in. Select this only if you're doing that
+                discovery work, not for a working build.
+    endchoice
+
+    config MODEM_APN
+        string "SIM APN"
+        default "airtelgprs.com"
+        help
+            Carrier APN, applied via PDP context setup. Same option name and
+            meaning regardless of which module above is selected. Examples:
+            airtelgprs.com, jionet, internet.
+
+    menu "Quectel EC200U-CN UART pins/baud"
+        depends on MODEM_MODULE_QUECTEL_EC200U_UART
+
+        config MODEM_UART_PORT_NUM
+            int "UART port number"
+            default 1
+            range 0 2
+            help
+                ESP32-S3 UART controller to use for the modem link. Avoid
+                UART0 if it's your console/flashing port.
+
+        config MODEM_UART_TX_PIN
+            int "TXD GPIO (ESP32-S3 -> module Rx)"
+            default 17
+            range 0 48
+
+        config MODEM_UART_RX_PIN
+            int "RXD GPIO (ESP32-S3 <- module Tx)"
+            default 18
+            range 0 48
+
+        config MODEM_UART_RTS_PIN
+            int "RTS GPIO (unused on Vanix TracX-1b)"
+            default 8
+            range -1 48
+            help
+                The EC200U-CN chip supports HW flow control, but the Vanix
+                TracX-1b carrier board's header doesn't break out
+                MAIN_RTS/MAIN_CTS. Unused while flow control stays at None.
+
+        config MODEM_UART_CTS_PIN
+            int "CTS GPIO (unused on Vanix TracX-1b)"
+            default 9
+            range -1 48
+
+        config MODEM_UART_BAUD_RATE
+            int "UART baud rate"
+            default 115200
+            help
+                Datasheet default. Changing this requires first setting the
+                module's own saved UART speed to match via AT+IPR=<rate> +
+                AT&W (persists across power cycles) BEFORE flashing firmware
+                built with the new rate -- see modem_set_uart_baud_persist()
+                once the Quectel UART backend is added.
+
+        choice MODEM_FLOW_CONTROL
+            prompt "UART flow control"
+            default MODEM_FLOW_CONTROL_NONE
+            help
+                Always None on the Vanix TracX-1b -- HW flow control needs
+                MAIN_RTS/MAIN_CTS wired, which this carrier board doesn't
+                expose. Software (XON/XOFF) is not a safe substitute over
+                PPP's raw binary data stream.
+
+            config MODEM_FLOW_CONTROL_NONE
+                bool "None"
+            config MODEM_FLOW_CONTROL_HW
+                bool "Hardware (RTS/CTS) -- not wireable on this carrier board"
+        endchoice
+    endmenu
+
+endmenu

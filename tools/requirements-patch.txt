@@ -1,0 +1,4 @@
+humanfriendly
+bitstruct
+heatshrink2
+pydivsufsort

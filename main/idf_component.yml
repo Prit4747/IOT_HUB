@@ -1,0 +1,19 @@
+dependencies:
+  # SimCom A7672S/USB backend (modem_simcom_a7672_usb.c). Only actually
+  # compiled/linked in when CONFIG_MODEM_MODULE_SIMCOM_A7672_USB is
+  # selected (see CMakeLists.txt REQUIRES) -- but the component manager
+  # resolves dependencies before Kconfig choices exist, so every module's
+  # deps end up listed here regardless of which one is active. Harmless:
+  # an unused managed component just sits in managed_components/ unbuilt.
+  espressif/iot_usbh_modem:
+    version: "^2.2.0"
+  # Quectel EC200U-CN/UART backend (modem_quectel_ec200u_uart.cpp). Same
+  # "listed regardless of active module" note as iot_usbh_modem above.
+  espressif/esp_modem:
+    version: "^1.0"
+  # ota_manager.c's delta OTA path (esp_delta_ota_*) -- generic, used
+  # regardless of which modem module is selected.
+  espressif/esp_delta_ota:
+    version: "1.*"
+  idf:
+    version: ">=5.3.0"

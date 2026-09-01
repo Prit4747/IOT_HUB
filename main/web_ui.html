@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3 IoT Hub</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;padding:16px}
+  h1{color:#00d4ff;font-size:1.4rem;margin-bottom:4px}
+  .subtitle{color:#888;font-size:.8rem;margin-bottom:16px}
+  .card{background:#16213e;border-radius:10px;padding:16px;margin-bottom:14px;border:1px solid #0f3460}
+  .card h2{font-size:.85rem;color:#00d4ff;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+  .status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .stat{background:#0f3460;border-radius:8px;padding:10px;text-align:center}
+  .stat .label{font-size:.65rem;color:#888;text-transform:uppercase;margin-bottom:4px}
+  .stat .value{font-size:1rem;font-weight:700;color:#e0e0e0}
+  .stat .value.small{font-size:.75rem;font-weight:600}
+  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.75rem;font-weight:600}
+  .badge.online{background:#0d5c2e;color:#4ade80}
+  .badge.offline{background:#5c1a1a;color:#f87171}
+  .badge.connecting{background:#5c4a0d;color:#fbbf24}
+  input[type=text]{width:100%;padding:10px 12px;background:#0a1628;border:1px solid #0f3460;border-radius:6px;color:#e0e0e0;font-size:.9rem;outline:none;transition:border .2s}
+  input[type=text]:focus{border-color:#00d4ff}
+  .btn{display:inline-block;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:.9rem;font-weight:600;transition:all .2s}
+  .btn-primary{background:linear-gradient(135deg,#00d4ff,#0080ff);color:#000}
+  .btn-primary:hover{opacity:.85}
+  .btn-secondary{background:#0f3460;color:#00d4ff;border:1px solid #00d4ff}
+  .btn-secondary:hover{background:#00d4ff;color:#000}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .progress-wrap{background:#0a1628;border-radius:6px;height:10px;margin:10px 0;overflow:hidden;display:none}
+  .progress-bar{height:100%;width:0%;background:linear-gradient(90deg,#00d4ff,#4ade80);transition:width .3s;border-radius:6px}
+  .progress-text{font-size:.8rem;color:#888;text-align:right}
+  #log{background:#0a1628;border-radius:6px;padding:10px;font-family:'Consolas','Courier New',monospace;font-size:.75rem;height:220px;overflow-y:auto;line-height:1.5;border:1px solid #0f3460;white-space:pre-wrap}
+  .log-info{color:#4ade80}
+  .log-warn{color:#fbbf24}
+  .log-err{color:#f87171}
+  .log-at{color:#00d4ff}
+  .log-sys{color:#a78bfa}
+  .url-row{display:flex;gap:8px;margin-bottom:8px}
+  .url-row input{flex:1}
+  .hint{font-size:.7rem;color:#666;margin-top:4px}
+</style>
+</head>
+<body>
+<h1>ESP32-S3 IoT Hub</h1>
+<p class="subtitle">Wi-Fi AP &middot; configurable modem module &middot; PPP OTA (full .bin or delta .patch)</p>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="status-grid">
+    <div class="stat"><div class="label">Module</div><div class="value small" id="s-module">—</div></div>
+    <div class="stat"><div class="label">Wi-Fi</div><div class="value" id="s-ssid">—</div></div>
+    <div class="stat"><div class="label">Firmware</div><div class="value" id="s-fw">—</div></div>
+    <div class="stat"><div class="label">Modem</div><div class="value" id="s-4g"><span class="badge offline">offline</span></div></div>
+    <div class="stat"><div class="label">IP</div><div class="value" id="s-ip">—</div></div>
+    <div class="stat"><div class="label">Operator</div><div class="value" id="s-op">—</div></div>
+    <div class="stat"><div class="label">RSSI</div><div class="value" id="s-rssi">—</div></div>
+  </div>
+  <div style="margin-top:10px">
+    <button class="btn btn-secondary" onclick="retryModem()" id="btn-retry">Retry modem</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>OTA URL &mdash; full image (.bin) or delta patch (.patch)</h2>
+  <div class="url-row">
+    <input type="text" id="ota-url" placeholder="https://example.com/firmware.bin" value="">
+    <button class="btn btn-primary" id="btn-ota" onclick="startOta()">Download OTA</button>
+  </div>
+  <div class="hint">Supports GitHub Releases, ngrok, or any HTTPS URL. Extension determines mode: .patch = delta OTA, anything else = full OTA.</div>
+  <div class="progress-wrap" id="prog-wrap">
+    <div class="progress-bar" id="prog-bar"></div>
+  </div>
+  <div class="progress-text" id="prog-text"></div>
+</div>
+
+<div class="card">
+  <h2>Process log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+const logEl = document.getElementById('log');
+let evtSource = null;
+
+function log(msg, cls=''){
+  const d = document.createElement('div');
+  if(cls) d.className = cls;
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function classify(line){
+  if(line.startsWith('AT:')) return 'log-at';
+  if(line.includes('ERROR')||line.includes('FAIL')) return 'log-err';
+  if(line.includes('WARN')||line.includes('warn')) return 'log-warn';
+  if(line.startsWith('OTA:')||line.startsWith('PPP:')||line.startsWith('SYS:')) return 'log-sys';
+  return 'log-info';
+}
+
+function startSSE(){
+  if(evtSource) evtSource.close();
+  evtSource = new EventSource('/events');
+  evtSource.onmessage = e => {
+    try{
+      const d = JSON.parse(e.data);
+      if(d.type==='log') log(d.msg, classify(d.msg));
+      if(d.type==='status') updateStatus(d);
+      if(d.type==='progress'){
+        document.getElementById('prog-wrap').style.display='block';
+        document.getElementById('prog-bar').style.width=d.pct+'%';
+        document.getElementById('prog-text').textContent=d.pct+'%  '+d.label;
+      }
+      if(d.type==='reboot'){
+        log('SYS: Rebooting in '+d.secs+' seconds...','log-warn');
+        document.getElementById('btn-ota').disabled=true;
+      }
+      if(d.type==='ota_failed'){
+        document.getElementById('btn-ota').disabled=false;
+        document.getElementById('prog-text').textContent='Failed';
+      }
+    }catch(err){}
+  };
+  evtSource.onerror = () => setTimeout(startSSE, 3000);
+}
+
+function updateStatus(d){
+  if(d.module) document.getElementById('s-module').textContent=d.module;
+  if(d.ssid) document.getElementById('s-ssid').textContent=d.ssid;
+  if(d.fw) document.getElementById('s-fw').textContent=d.fw;
+  if(d.ip) document.getElementById('s-ip').textContent=d.ip;
+  if(d.op) document.getElementById('s-op').textContent=d.op;
+  if(d.rssi!==undefined) document.getElementById('s-rssi').textContent=d.rssi;
+  if(d.state!==undefined){
+    const el=document.getElementById('s-4g');
+    const map={0:'<span class="badge offline">offline</span>',
+               1:'<span class="badge connecting">connecting</span>',
+               2:'<span class="badge online">online</span>'};
+    el.innerHTML=map[d.state]||map[0];
+  }
+}
+
+function retryModem(){
+  fetch('/modem/retry',{method:'POST'})
+    .then(()=>log('SYS: Modem retry requested','log-sys'))
+    .catch(()=>log('SYS: Request failed','log-err'));
+}
+
+function startOta(){
+  const url=document.getElementById('ota-url').value.trim();
+  if(!url){log('SYS: Enter an OTA URL first','log-warn');return;}
+  document.getElementById('btn-ota').disabled=true;
+  document.getElementById('prog-wrap').style.display='block';
+  document.getElementById('prog-bar').style.width='0%';
+  document.getElementById('prog-text').textContent='Starting...';
+  fetch('/ota/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:url})})
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.ok) log('OTA: Download started','log-sys');
+      else { log('OTA: '+d.err,'log-err'); document.getElementById('btn-ota').disabled=false; }
+    })
+    .catch(()=>{log('OTA: Request failed','log-err');document.getElementById('btn-ota').disabled=false;});
+}
+
+fetch('/status').then(r=>r.json()).then(updateStatus).catch(()=>{});
+startSSE();
+</script>
+</body>
+</html>
