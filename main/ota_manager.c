@@ -34,6 +34,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -514,6 +515,62 @@ cleanup:
 /*  Task                                                                */
 /* ------------------------------------------------------------------ */
 
+/* At least one backend's modem_ppp_stop() (the SimCom/USB one, wrapping
+ * usbh_modem_ppp_stop()) is documented -- by that backend's own code -- as
+ * able to block forever if the hang-up AT command never gets a reply
+ * (ATH sent while still in USB data mode). Calling the pre-reboot hook
+ * straight from ota_task() would mean that hang could silently swallow
+ * esp_restart() and never actually reboot after a successful OTA. Running
+ * it in its own task and only waiting a bounded time for it here means a
+ * stuck hook can never block the reboot -- worst case, the hook's cleanup
+ * doesn't finish and the reboot proceeds anyway, which is the same
+ * outcome esp_restart() would force a moment later regardless. */
+#define PRE_REBOOT_HOOK_TIMEOUT_MS 5000
+
+typedef struct {
+    ota_pre_reboot_hook_t hook;
+    SemaphoreHandle_t      done;
+} pre_reboot_ctx_t;
+
+static void pre_reboot_hook_task(void *arg)
+{
+    pre_reboot_ctx_t *ctx = (pre_reboot_ctx_t *)arg;
+    ctx->hook();
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+static void run_pre_reboot_hook_bounded(void)
+{
+    ota_log("Running pre-reboot hook (bounded to %d ms)...", PRE_REBOOT_HOOK_TIMEOUT_MS);
+
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) {
+        ota_log("Pre-reboot hook: no memory for semaphore, skipping");
+        return;
+    }
+
+    static pre_reboot_ctx_t ctx;
+    ctx.hook = s_pre_reboot_hook;
+    ctx.done = done;
+
+    if (xTaskCreate(pre_reboot_hook_task, "ota_prereboot", 4096, &ctx, 5, NULL) != pdPASS) {
+        ota_log("Pre-reboot hook: task create failed, skipping");
+        vSemaphoreDelete(done);
+        return;
+    }
+
+    if (xSemaphoreTake(done, pdMS_TO_TICKS(PRE_REBOOT_HOOK_TIMEOUT_MS)) == pdTRUE) {
+        vSemaphoreDelete(done);
+    } else {
+        /* Deliberately NOT deleting `done` or otherwise cleaning up here --
+         * the still-running hook task might touch it later. Harmless: the
+         * whole system reboots within seconds either way (see ota_task()
+         * below), which reclaims everything regardless. */
+        ota_log("Pre-reboot hook did not finish in time -- rebooting anyway");
+    }
+}
+
 static void ota_task(void *arg)
 {
     (void)arg;
@@ -529,8 +586,7 @@ static void ota_task(void *arg)
          * a modem backend uses this to leave the link in a clean state
          * (e.g. hang up PPP) before the reboot below. */
         if (s_pre_reboot_hook) {
-            ota_log("Running pre-reboot hook...");
-            s_pre_reboot_hook();
+            run_pre_reboot_hook_bounded();
         }
 
         if (s_event_cb) {

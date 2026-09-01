@@ -146,6 +146,28 @@ void app_main(void)
     ESP_ERROR_CHECK(ppp_manager_init_events());
 
     web_server_set_status(s_fw, AP_NAME, 1, "-", "-", 0);
+
+    /* Unconditional PWRKEY power-cycle before the very first modem_install()
+     * attempt -- not just on failure. Root cause this works around: the
+     * ESP32's own USB host peripheral resets whenever the ESP32 itself
+     * resets (OTA reboot, brownout, manual reset button -- any of them),
+     * which looks like an abrupt USB disconnect to the modem. Observed in
+     * practice: the A7672S doesn't always recover cleanly from that on its
+     * own and gets stuck needing a physical PWRKEY cycle before it will
+     * sync again -- previously that meant a manual power-cycle after every
+     * ESP reset. A software PWRKEY cycle (modem_hal.h's
+     * modem_hard_power_cycle(), same GPIO the manual recovery used) run
+     * once here, before install, guarantees every boot starts from a known
+     * clean modem power state regardless of what happened before the
+     * reset -- including a true cold boot, where the OFF-pulse is simply a
+     * no-op on an already-off module and the module still ends up powered
+     * on afterward. The cost is a fixed ~8s added to every boot; the
+     * previous failure-triggered recovery path (still below, for a modem
+     * that gets wedged again mid-run) took several minutes to kick in by
+     * comparison. */
+    push_log("SYS: power-cycling modem before first install (clean state after any ESP reset)");
+    modem_hard_power_cycle();
+
     push_log("SYS: booted -- starting modem (%s)", modem_module_name());
 
     bool online = false;
