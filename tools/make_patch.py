@@ -26,14 +26,29 @@ import struct
 import sys
 import tempfile
 
-# Prefer full detools checkout (tools/detools-src) then bundled copy.
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-for _detools_root in (
-    os.path.join(_SCRIPT_DIR, "detools-src"),
-    os.path.join(_SCRIPT_DIR, "..", "managed_components", "espressif__esp_delta_ota", "detools"),
-):
-    if os.path.isdir(_detools_root) and _detools_root not in sys.path:
-        sys.path.insert(0, _detools_root)
+# Prefer a properly pip-installed `detools` (has the compiled bsdiff C
+# extension) over any local fallback copy. This used to unconditionally
+# prepend tools/detools-src or the esp_delta_ota component's bundled
+# detools/ source onto sys.path whenever either directory existed on
+# disk -- but the component's bundled copy is meant for on-device patch
+# APPLY only and ships without the compiled bsdiff extension needed for
+# patch CREATION, so if it existed at all it silently shadowed a working
+# `pip install detools` and broke create_patch() with
+# "No module named 'detools.bsdiff'" (hit in practice, not hypothetical).
+# Only fall back to a local copy if a real, complete `detools` isn't
+# already importable from the environment.
+try:
+    import detools as _detools_probe
+    import detools.bsdiff as _detools_bsdiff_probe  # noqa: F401
+    del _detools_probe, _detools_bsdiff_probe
+except ImportError:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    for _detools_root in (
+        os.path.join(_SCRIPT_DIR, "detools-src"),
+        os.path.join(_SCRIPT_DIR, "..", "managed_components", "espressif__esp_delta_ota", "detools"),
+    ):
+        if os.path.isdir(_detools_root) and _detools_root not in sys.path:
+            sys.path.insert(0, _detools_root)
 
 MAGIC = 0xFCCDDE10
 MAGIC_SIZE = 4
