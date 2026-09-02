@@ -40,9 +40,16 @@ extern "C" {
 
 /* Applied to the PPP netif in ppp_manager.c's apply_got_ip() -- see the
  * comment there for why (HTTPS OTA connect failures over cellular PPP
- * that plain HTTP didn't hit, traced to MTU). 1400 is conservative;
- * lower further (1350/1300) if HTTPS connects are still unreliable. */
-#define PPP_MTU                     1400
+ * that plain HTTP didn't hit, traced to MTU). Started at 1400 (worked for
+ * the SimCom/USB backend); the Quectel/UART backend hit the identical
+ * "delayed connect error: Software caused connection abort" failure
+ * even with that value in place -- UART PPPoS framing overhead differs
+ * from USB CDC's, so the same nominal MTU doesn't guarantee the same
+ * effective path MTU. Lowered to 1300, shared across both backends
+ * (a smaller MTU is always safe, just marginally less throughput-
+ * efficient for the backend that didn't strictly need it). Lower further
+ * (1250/1200) if HTTPS connects are still unreliable at this value. */
+#define PPP_MTU                     1300
 
 #define RETRY_BASE_DELAY_MS         3000
 #define RETRY_MAX_DELAY_MS          60000
