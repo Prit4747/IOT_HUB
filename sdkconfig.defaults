@@ -23,6 +23,22 @@ CONFIG_LWIP_PPP_ENABLE_IPV6=n
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 CONFIG_LWIP_MAX_SOCKETS=16
 
+# LCP echo keepalives -- off by default in ESP-IDF. Without this, PPP has
+# no way to detect a link that's silently died server-side (a common
+# cellular carrier behavior: an idle PDP/NAT session gets dropped after
+# some minutes with no explicit PPP terminate sent back) -- the app just
+# keeps believing it's connected since no LOST_IP event ever fires.
+# Observed in practice: internet self-test passed at boot, then an OTA
+# attempt ~8 minutes later (no traffic in between) failed every DNS
+# lookup with a real ~14s timeout each try, not an instant rejection --
+# the exact signature of packets going into a dead link rather than an
+# active refusal. 5s interval / 3 max fails means a genuinely dead link
+# gets detected (and ppp_manager's existing LOST_IP-driven reconnect
+# logic kicks in) within ~15-20s of going idle-dead, instead of never.
+CONFIG_LWIP_ENABLE_LCP_ECHO=y
+CONFIG_LWIP_LCP_ECHOINTERVAL=5
+CONFIG_LWIP_LCP_MAXECHOFAILS=3
+
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=64
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
