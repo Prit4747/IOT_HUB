@@ -168,6 +168,16 @@ void app_main(void)
     push_log("SYS: power-cycling modem before first install (clean state after any ESP reset)");
     modem_hard_power_cycle();
 
+    /* Extra settle time beyond modem_install()'s own boot-wait -- see
+     * MODEM_BOOT_POWER_CYCLE_SETTLE_MS in config.h for the full story.
+     * In short: this power-cycle (unlike the mid-session recovery one
+     * below, which always has a 60s buffer before the next attempt) was
+     * observed going straight into a failing first install because the
+     * modem's baseband hadn't finished a cold boot yet. */
+    push_log("SYS: waiting %d ms for modem to finish booting after power-cycle...",
+             MODEM_BOOT_POWER_CYCLE_SETTLE_MS);
+    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_POWER_CYCLE_SETTLE_MS));
+
     push_log("SYS: booted -- starting modem (%s)", modem_module_name());
 
     bool online = false;

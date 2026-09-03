@@ -54,6 +54,26 @@ extern "C" {
 #define RETRY_BASE_DELAY_MS         3000
 #define RETRY_MAX_DELAY_MS          60000
 
+/* Extra settle time main.c waits, once, right after the boot-time
+ * modem_hard_power_cycle() call (added to auto-recover a modem left
+ * wedged by an ESP reset) -- before the FIRST modem_install() attempt.
+ *
+ * The same modem_hard_power_cycle() also runs mid-session as failure
+ * recovery, where it was never a problem: that path is always followed
+ * by a full 60s "all attempts failed -- retry" wait before the next
+ * install, giving the module's baseband ample time to finish a cold
+ * boot. The boot-time call has no such buffer -- modem_install() only
+ * waits its own MODEM_BOOT_WAIT_MS/MODEM_USB_BOOT_WAIT_MS (3-5s) before
+ * opening the AT channel, which is enough for a modem that was already
+ * running, but not for one just power-cycled from OFF. Observed directly
+ * (2026-09-02, Quectel EC200U-CN): get_signal_quality failed immediately
+ * and every dial attempt failed for a full 5-retry cycle when the module
+ * only got ~5s between the power-cycle's ON pulse and the first AT
+ * command. This delay closes that gap; it's generic (main.c, not
+ * per-backend) since the same insufficient-settle-time risk applies to
+ * any backend's cold boot, not just Quectel's. */
+#define MODEM_BOOT_POWER_CYCLE_SETTLE_MS 15000
+
 /* -------------------------------------------------------------------- */
 /*  Per-module                                                           */
 /* -------------------------------------------------------------------- */
