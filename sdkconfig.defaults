@@ -39,6 +39,12 @@ CONFIG_LWIP_ENABLE_LCP_ECHO=y
 CONFIG_LWIP_LCP_ECHOINTERVAL=5
 CONFIG_LWIP_LCP_MAXECHOFAILS=3
 
+# Quectel EC200U: send +++ when leaving PPP DATA -> COMMAND. Makes hang-up
+# and post-reset recovery more reliable on this module (esp_modem Kconfig
+# notes SIMCOM can dislike it -- only needed for the UART Quectel path,
+# and harmless for USB builds that never exercise esp_modem's escape).
+CONFIG_ESP_MODEM_PPP_ESCAPE_BEFORE_EXIT=y
+
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=64
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

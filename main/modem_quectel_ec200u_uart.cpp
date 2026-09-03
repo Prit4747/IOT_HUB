@@ -40,9 +40,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_private/esp_gpio_reserve.h"
 #include "esp_modem_config.h"
 #include "cxx_include/esp_modem_api.hpp"
 
@@ -54,6 +56,90 @@ static const char *TAG = "MODEM_QUECTEL_UART";
 static esp_netif_t *s_netif = nullptr;
 static std::shared_ptr<esp_modem::DTE> s_dte;
 static std::unique_ptr<esp_modem::DCE> s_dce;
+
+static void modem_release_uart_pins(void)
+{
+    const int pins[] = {
+        MODEM_UART_TX_GPIO, MODEM_UART_RX_GPIO,
+        MODEM_UART_RTS_GPIO, MODEM_UART_CTS_GPIO,
+    };
+    uint64_t mask = 0;
+    for (int pin : pins) {
+        if (pin >= 0) {
+            mask |= BIT64(pin);
+            gpio_reset_pin((gpio_num_t)pin);
+        }
+    }
+    /* uart_driver_delete() does not clear esp_gpio_reserve(); without this
+     * the next uart_set_pin() warns "GPIO N is not usable" (seen every
+     * retry in v0.2.9). Warning is not always fatal, but revoke keeps the
+     * pin mux bookkeeping honest. */
+    if (mask) {
+        esp_gpio_revoke(mask);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+static void modem_destroy_session(void)
+{
+    s_dce.reset();
+    s_dte.reset();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    /* Belt-and-suspenders: DTE dtor should delete the driver; if a prior
+     * install aborted oddly, force the port free before the next create. */
+    (void)uart_driver_delete((uart_port_t)MODEM_UART_PORT_NUM);
+    modem_release_uart_pins();
+    if (s_netif) {
+        esp_netif_destroy(s_netif);
+        s_netif = nullptr;
+    }
+}
+
+static bool modem_at_sync(int budget_ms)
+{
+    if (!s_dce) {
+        return false;
+    }
+    std::string out;
+    int waited = 0;
+    const int try_ms = 1000;
+    while (waited < budget_ms) {
+        if (s_dce->at("AT", out, try_ms) == esp_modem::command_result::OK) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+        waited += try_ms + 200;
+    }
+    return false;
+}
+
+/* Exit online PPP/DATA without going through DCE::set_mode(COMMAND)
+ * (that path stops the PPP netif and often never sends +++).
+ *
+ * Critical: do NOT spam AT for many seconds first -- those bytes go into
+ * the PPP stream and can leave the modem ignoring a later +++. One failed
+ * AT, then guarded +++ via the raw UART driver. */
+static bool modem_escape_data_mode(void)
+{
+    ESP_LOGW(TAG, "Trying +++ escape (modem likely left in PPP DATA after ESP reset)");
+    (void)uart_flush((uart_port_t)MODEM_UART_PORT_NUM);
+
+    for (int round = 0; round < 2; round++) {
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        const char esc[] = "+++";
+        (void)uart_write_bytes((uart_port_t)MODEM_UART_PORT_NUM, esc, 3);
+        (void)uart_wait_tx_done((uart_port_t)MODEM_UART_PORT_NUM, pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(1200));
+
+        if (modem_at_sync(4000)) {
+            std::string out;
+            (void)s_dce->at("ATH", out, 3000);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            return modem_at_sync(3000);
+        }
+    }
+    return false;
+}
 
 esp_err_t modem_install(const char *apn)
 {
@@ -74,6 +160,10 @@ esp_err_t modem_install(const char *apn)
 
     ESP_LOGI(TAG, "Waiting %d ms for modem boot before opening UART...", MODEM_BOOT_WAIT_MS);
     vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_WAIT_MS));
+
+    /* Ensure a clean UART port if a previous install leaked the driver. */
+    (void)uart_driver_delete((uart_port_t)MODEM_UART_PORT_NUM);
+    modem_release_uart_pins();
 
     esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
     s_netif = esp_netif_new(&netif_ppp_config);
@@ -122,8 +212,23 @@ esp_err_t modem_install(const char *apn)
     if (!s_dce) {
         ESP_LOGE(TAG, "create_generic_dce failed");
         s_dte.reset();
+        (void)uart_driver_delete((uart_port_t)MODEM_UART_PORT_NUM);
+        modem_release_uart_pins();
         esp_netif_destroy(s_netif);
         s_netif = nullptr;
+        return ESP_FAIL;
+    }
+
+    /* One short AT probe. If silent, escape DATA immediately -- do not
+     * hammer AT for seconds (that poisons +++ on Quectel). */
+    if (modem_at_sync(1500)) {
+        ESP_LOGI(TAG, "Modem AT sync OK");
+    } else if (modem_escape_data_mode()) {
+        ESP_LOGI(TAG, "Modem AT sync OK after +++ escape");
+    } else {
+        ESP_LOGE(TAG, "Modem not responding on UART after +++ -- aborting install "
+                 "(if PWRKEY/RST are unwired, power-cycle modem VBAT)");
+        modem_destroy_session();
         return ESP_FAIL;
     }
 
@@ -131,7 +236,7 @@ esp_err_t modem_install(const char *apn)
     if (s_dce->get_signal_quality(rssi, ber) == esp_modem::command_result::OK) {
         ESP_LOGI(TAG, "Modem responding: signal quality rssi=%d ber=%d", rssi, ber);
     } else {
-        ESP_LOGW(TAG, "get_signal_quality failed -- check UART wiring/baud");
+        ESP_LOGW(TAG, "get_signal_quality failed after AT sync");
     }
 
     /* Don't dial PPP until the modem has actually attached to the network
@@ -165,12 +270,15 @@ esp_err_t modem_install(const char *apn)
 
 esp_err_t modem_uninstall(void)
 {
-    s_dce.reset();
-    s_dte.reset();
-    if (s_netif) {
-        esp_netif_destroy(s_netif);
-        s_netif = nullptr;
+    /* Prefer an orderly hang-up before tearing the DCE down. Callers in
+     * main.c also call modem_ppp_stop() first; this is a safety net for
+     * any path that uninstalls directly. */
+    if (s_dce) {
+        (void)s_dce->set_mode(esp_modem::modem_mode::COMMAND_MODE);
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
+
+    modem_destroy_session();
     ESP_LOGW(TAG, "Modem DCE + PPP netif destroyed");
     return ESP_OK;
 }
@@ -216,14 +324,12 @@ void modem_read_status(char *op_buf, size_t op_len, int *rssi_out)
         return;
     }
 
-    if (op_buf && op_len) {
-        std::string name;
-        int act = 0;
-        if (s_dce->get_operator_name(name, act) == esp_modem::command_result::OK && !name.empty()) {
-            strncpy(op_buf, name.c_str(), op_len - 1);
-            op_buf[op_len - 1] = '\0';
-        }
-    }
+    /* UART PPPoS shares one channel with PPP -- COMMAND mode only.
+     *
+     * Deliberately skip get_operator_name()/AT+COPS?: esp_modem's default
+     * COPS timeout is 75s. When the network is still registering that
+     * single call blocked dial by ~75s (v0.2.7 log gap 75893→150903) and
+     * is not needed for bring-up. RSSI via CSQ is enough for the UI. */
 
     if (rssi_out) {
         int rssi = 99, ber = 99;

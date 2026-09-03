@@ -43,6 +43,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/dns.h"
 
 #include "ppp_manager.h"
 #include "modem_hal.h"
@@ -101,7 +102,11 @@ static void apply_got_ip(esp_netif_t *nif, const esp_netif_ip_info_t *ip_info)
         ESP_LOGW(TAG, "esp_netif_get_netif_impl returned NULL -- MTU not changed");
     }
 
-    /* Always force a known-good public resolver -- see file-header note. */
+    /* Always force a known-good public resolver -- see file-header note.
+     * Set both esp_netif DNS *and* lwIP dns_setserver(): with SoftAP + PPP
+     * up together, getaddrinfo can miss netif-only DNS and fail even though
+     * PPP has a valid CGNAT address (seen as "internet self-test FAILED"
+     * immediately after GOT_IP). */
     esp_netif_dns_info_t dns_main = {0};
     dns_main.ip.type = ESP_IPADDR_TYPE_V4;
     IP4_ADDR(&dns_main.ip.u_addr.ip4, 8, 8, 8, 8);
@@ -111,6 +116,12 @@ static void apply_got_ip(esp_netif_t *nif, const esp_netif_ip_info_t *ip_info)
     dns_backup.ip.type = ESP_IPADDR_TYPE_V4;
     IP4_ADDR(&dns_backup.ip.u_addr.ip4, 8, 8, 4, 4);
     esp_netif_set_dns_info(nif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+
+    ip_addr_t dns0, dns1;
+    IP_ADDR4(&dns0, 8, 8, 8, 8);
+    IP_ADDR4(&dns1, 8, 8, 4, 4);
+    dns_setserver(0, &dns0);
+    dns_setserver(1, &dns1);
 
     esp_netif_set_default_netif(nif);
     s_connected = true;
@@ -150,6 +161,10 @@ static void on_ppp_changed(void *arg, esp_event_base_t base, int32_t id, void *d
     ESP_LOGI(TAG, "PPP status event id=%" PRId32, id);
     if (id == NETIF_PPP_ERRORUSER) {
         ESP_LOGW(TAG, "PPP user interrupt (netif torn down)");
+    } else if (id == NETIF_PPP_ERRORPEERDEAD) {
+        /* LCP echo keepalives (CONFIG_LWIP_ENABLE_LCP_ECHO) decided the
+         * peer stopped answering -- usually carrier/modem dropped PPP. */
+        ESP_LOGW(TAG, "PPP peer dead (LCP echo timeout) -- link will be recovered");
     }
 }
 
@@ -232,29 +247,11 @@ bool ppp_manager_is_connected(void)
     return s_connected;
 }
 
-esp_err_t ppp_manager_verify_connectivity(const char *host, int port)
+static esp_err_t tcp_connect_addr(const struct sockaddr *addr, socklen_t addrlen,
+                                  const char *label)
 {
-    if (!s_connected) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    struct addrinfo hints = {0};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = NULL;
-
-    ESP_LOGI(TAG, "DNS lookup: %s", host);
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || res == NULL) {
-        ESP_LOGE(TAG, "DNS failed");
-        return ESP_FAIL;
-    }
-
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
-        freeaddrinfo(res);
         return ESP_FAIL;
     }
 
@@ -265,14 +262,75 @@ esp_err_t ppp_manager_verify_connectivity(const char *host, int port)
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     esp_err_t ret = ESP_OK;
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-        ESP_LOGE(TAG, "TCP connect %s:%d failed errno=%d", host, port, errno);
+    if (connect(sock, addr, addrlen) != 0) {
+        ESP_LOGE(TAG, "TCP connect %s failed errno=%d", label, errno);
         ret = ESP_FAIL;
     } else {
-        ESP_LOGI(TAG, "TCP connect %s:%d ok", host, port);
+        ESP_LOGI(TAG, "TCP connect %s ok", label);
+    }
+    close(sock);
+    return ret;
+}
+
+esp_err_t ppp_manager_verify_connectivity(const char *host, int port)
+{
+    if (!s_connected) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    close(sock);
-    freeaddrinfo(res);
-    return ret;
+    /* SoftAP is also up -- re-assert PPP as default + lwIP DNS every time
+     * before testing, in case anything flipped the default route back. */
+    esp_netif_t *nif = modem_get_netif();
+    if (nif) {
+        esp_netif_set_default_netif(nif);
+    }
+    ip_addr_t dns0, dns1;
+    IP_ADDR4(&dns0, 8, 8, 8, 8);
+    IP_ADDR4(&dns1, 8, 8, 4, 4);
+    dns_setserver(0, &dns0);
+    dns_setserver(1, &dns1);
+
+    /* Brief settle: IPCP just finished; immediate DNS sometimes fails. */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        struct addrinfo hints = {0};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+
+        ESP_LOGI(TAG, "DNS lookup: %s (try %d/3)", host, attempt);
+        int gai = getaddrinfo(host, port_str, &hints, &res);
+        if (gai == 0 && res != NULL) {
+            char label[64];
+            snprintf(label, sizeof(label), "%s:%d", host, port);
+            esp_err_t ret = tcp_connect_addr(res->ai_addr, res->ai_addrlen, label);
+            freeaddrinfo(res);
+            if (ret == ESP_OK) {
+                return ESP_OK;
+            }
+        } else {
+            ESP_LOGW(TAG, "DNS failed (try %d/3, gai=%d)", attempt, gai);
+            if (res) {
+                freeaddrinfo(res);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* DNS may be filtered by the carrier while raw IP still works -- prove
+     * the data path with a numeric connect so OTA isn't blocked on DNS
+     * alone (OTA URLs still need DNS; this separates the failures). */
+    ESP_LOGW(TAG, "DNS path failed -- trying numeric fallback 1.1.1.1:80");
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(80);
+    sa.sin_addr.s_addr = ipaddr_addr("1.1.1.1");
+    if (tcp_connect_addr((struct sockaddr *)&sa, sizeof(sa), "1.1.1.1:80") == ESP_OK) {
+        ESP_LOGW(TAG, "IP data path OK but DNS broken -- treat as FAIL for OTA");
+    }
+    return ESP_FAIL;
 }

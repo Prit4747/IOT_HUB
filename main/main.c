@@ -74,6 +74,20 @@ static void modem_hangup_before_reboot(void)
     }
 }
 
+/* Hang up PPP (COMMAND mode) before destroying DCE/UART. Skipping this is
+ * the main Quectel/UART regression vs the standalone project: destroying
+ * while still in DATA mode leaves the modem mid-PPP across reinstall, and
+ * the UART driver can keep TX/RX GPIOs claimed ("GPIO N is not usable"). */
+static void modem_teardown(void)
+{
+    if (!modem_is_installed()) {
+        return;
+    }
+    (void)modem_ppp_stop();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    modem_uninstall();
+}
+
 static bool ppp_bring_up(void)
 {
     for (int attempt = 1; attempt <= MAX_PPP_RETRIES; attempt++) {
@@ -82,12 +96,36 @@ static bool ppp_bring_up(void)
         if (!modem_is_installed()) {
             if (modem_install(CONFIG_MODEM_APN) != ESP_OK) {
                 push_log("PPP: modem_install failed");
+                /* Prefer RST over PWRKEY first: on this Quectel carrier,
+                 * software PWRKEY was previously observed to leave a healthy
+                 * module wedged, while a real VBAT cut (manual) recovers.
+                 * RST is the datasheet last-resort baseband reset. */
+                if (attempt == 1) {
+                    push_log("PPP: pulsing RST after AT sync failure");
+                    modem_hard_reset();
+                    vTaskDelay(pdMS_TO_TICKS(8000));
+                } else if (attempt == 2) {
+                    push_log("PPP: hard power-cycling modem via PWRKEY (verify GPIO4 wired)");
+                    modem_hard_power_cycle();
+                    push_log("PPP: waiting %d ms for modem boot after power-cycle...",
+                             MODEM_BOOT_POWER_CYCLE_SETTLE_MS);
+                    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_POWER_CYCLE_SETTLE_MS));
+                }
                 goto backoff;
             }
         }
 
+        /* Operator/RSSI MUST be read in COMMAND mode. UART PPPoS has a
+         * single channel -- AT while PPP is up injects into the data
+         * stream, corrupts framing, and eventually trips LCP peer-dead
+         * (NETIF_PPP_ERRORPEERDEAD / "Connection timeout"). USB backends
+         * have a separate AT path so they tolerate post-dial reads, but
+         * reading here keeps both backends correct. */
+        modem_read_status(s_op, sizeof(s_op), &s_rssi);
+
         if (modem_ppp_start() != ESP_OK) {
-            push_log("PPP: modem_ppp_start failed");
+            push_log("PPP: modem_ppp_start failed -- restoring command mode");
+            (void)modem_ppp_stop();
             goto backoff;
         }
 
@@ -97,7 +135,11 @@ static bool ppp_bring_up(void)
             return true;
         }
 
-        push_log("PPP: GOT_IP timeout");
+        /* Standalone Quectel always restored COMMAND mode here; the merge
+         * dropped it, so retries called set_mode(DATA) on a modem already
+         * stuck mid-PPP and failed until a full power-cycle. */
+        push_log("PPP: GOT_IP timeout -- restoring command mode");
+        (void)modem_ppp_stop();
 
 backoff:
         if (attempt < MAX_PPP_RETRIES) {
@@ -200,7 +242,7 @@ void app_main(void)
                 web_server_set_status(s_fw, AP_NAME, 0, "-", s_op, s_rssi);
                 push_log("PPP: all attempts failed -- resetting modem (AT+CFUN=1,1)");
                 modem_force_reset();
-                modem_uninstall();
+                modem_teardown();
                 push_log("PPP: hard power-cycling modem via PWRKEY");
                 modem_hard_power_cycle();
                 web_server_set_status(s_fw, AP_NAME, 1, "-", s_op, s_rssi);
@@ -222,14 +264,21 @@ void app_main(void)
                 esp_netif_set_default_netif(nif);
             }
 
-            modem_read_status(s_op, sizeof(s_op), &s_rssi);
+            /* s_op/s_rssi already captured in COMMAND mode before dial. */
             web_server_set_status(s_fw, AP_NAME, 2, s_ip, s_op, s_rssi);
             push_log("PPP: ONLINE IP=%s op=%s rssi=%d", s_ip, s_op, s_rssi);
 
             if (ppp_manager_verify_connectivity(PPP_TEST_HOST, PPP_TEST_PORT) == ESP_OK) {
                 push_log("PPP: internet OK -- OTA ready");
             } else {
-                push_log("PPP: internet self-test FAILED");
+                /* PPP IP without working DNS/TCP is useless for OTA -- do not
+                 * stay "online" and pretend we are ready. Tear down and
+                 * retry the full bring-up path. */
+                push_log("PPP: internet self-test FAILED -- recovering");
+                modem_teardown();
+                online = false;
+                web_server_set_status(s_fw, AP_NAME, 1, "-", s_op, s_rssi);
+                vTaskDelay(pdMS_TO_TICKS(3000));
             }
         }
 
@@ -237,7 +286,7 @@ void app_main(void)
 
         if (web_server_retry_requested()) {
             push_log("PPP: reconnect from Web UI");
-            modem_uninstall();
+            modem_teardown();
             online = false;
             web_server_set_status(s_fw, AP_NAME, 1, "-", s_op, s_rssi);
             continue;
@@ -252,7 +301,7 @@ void app_main(void)
 
         if (!ppp_manager_is_connected()) {
             push_log("PPP: link lost -- recovering");
-            modem_uninstall();
+            modem_teardown();
             online = false;
             web_server_set_status(s_fw, AP_NAME, 1, "-", s_op, s_rssi);
         }
