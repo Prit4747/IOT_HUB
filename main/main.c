@@ -164,7 +164,17 @@ void app_main(void)
      * on afterward. The cost is a fixed ~8s added to every boot; the
      * previous failure-triggered recovery path (still below, for a modem
      * that gets wedged again mid-run) took several minutes to kick in by
-     * comparison. */
+     * comparison.
+     *
+     * MODEM_BOOT_POWER_CYCLE (config.h, per-module) gates this: confirmed
+     * genuinely needed for SimCom/USB, but confirmed on 2026-09-03 (direct
+     * A/B against the pre-unification standalone Quectel project, same
+     * hardware/wiring/session) to actively break an already-fine Quectel
+     * module instead of helping it -- see the comment on
+     * MODEM_BOOT_POWER_CYCLE in the Quectel block of config.h for the
+     * full story. Not every backend needs this, and for at least one it's
+     * actively harmful, so it's opt-in per module rather than universal. */
+#if MODEM_BOOT_POWER_CYCLE
     push_log("SYS: power-cycling modem before first install (clean state after any ESP reset)");
     modem_hard_power_cycle();
 
@@ -177,6 +187,7 @@ void app_main(void)
     push_log("SYS: waiting %d ms for modem to finish booting after power-cycle...",
              MODEM_BOOT_POWER_CYCLE_SETTLE_MS);
     vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_POWER_CYCLE_SETTLE_MS));
+#endif
 
     push_log("SYS: booted -- starting modem (%s)", modem_module_name());
 

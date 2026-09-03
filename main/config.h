@@ -108,6 +108,13 @@ extern "C" {
  * needed on a custom PCB where GPIO19/20 go straight to the modem. */
 #define OTG_USB_SEL_GPIO            18
 
+/* main.c power-cycles the modem once via PWRKEY before the very first
+ * modem_install() attempt on every boot -- see MODEM_BOOT_POWER_CYCLE_SETTLE_MS
+ * above for the full "why" (ESP32 USB host peripheral resetting looks
+ * like an abrupt disconnect to this module, which doesn't always recover
+ * from that on its own). Confirmed needed for this backend specifically. */
+#define MODEM_BOOT_POWER_CYCLE      1
+
 #elif defined(CONFIG_MODEM_MODULE_QUECTEL_EC200U_UART)
 
 /*
@@ -177,6 +184,22 @@ extern "C" {
  * burns a PPP retry cycle on a guaranteed failure. */
 #define MODEM_NET_ATTACH_TIMEOUT_MS 30000
 #define MODEM_NET_ATTACH_POLL_MS    1000
+
+/* UNLIKE the SimCom/USB backend, do NOT power-cycle this modem before the
+ * first modem_install() attempt on every boot. Confirmed directly
+ * (2026-09-03) via a controlled comparison on identical hardware/wiring/
+ * baud: the standalone (pre-unification) Quectel_EC200U project, which
+ * never touches PWRKEY on a normal boot, connected cleanly on the first
+ * try; this project, with the boot-time power-cycle enabled, failed
+ * every single AT exchange in the exact same session, on the exact same
+ * hardware, moments later -- extending the settle delay afterward
+ * (15s, then more) made no difference, which rules out "not enough time"
+ * and points at the power-cycle sequence itself leaving this specific
+ * module unresponsive. This module already auto-powers-on cleanly from
+ * VBAT with no PWRKEY pulse needed (datasheet section 4.3.1) -- the
+ * boot-time power-cycle was solving a USB-specific problem this UART
+ * module never had, and was actively breaking it instead of helping. */
+#define MODEM_BOOT_POWER_CYCLE      0
 
 #elif defined(CONFIG_MODEM_MODULE_QUECTEL_EC200U_USB)
 
