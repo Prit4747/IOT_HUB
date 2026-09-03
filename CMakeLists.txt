@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 # Bump for each release when generating delta OTA patches (tools/make_patch.py
 # diffs against the .bin matching the PROJECT_VER currently on the device).
-set(PROJECT_VER "v0.2.12-quectel-uart")
+set(PROJECT_VER "v0.2.13-quectel-uart")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 

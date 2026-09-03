@@ -277,7 +277,37 @@ static esp_err_t delta_read_cb(uint8_t *buf, size_t size, int offset, void *user
     return esp_partition_read(ctx->src_part, (size_t)offset, buf, size);
 }
 
-static bool verify_patch_header(const uint8_t *hdr)
+/* Parse ".../vA_to_vB.patch" filenames used by our release assets. */
+static bool parse_delta_patch_versions(const char *url,
+                                       char *from, size_t from_sz,
+                                       char *to, size_t to_sz)
+{
+    if (!url || !from || !to || from_sz < 2 || to_sz < 2) {
+        return false;
+    }
+    const char *slash = strrchr(url, '/');
+    const char *name = slash ? slash + 1 : url;
+    const char *sep = strstr(name, "_to_");
+    if (!sep) {
+        return false;
+    }
+    const char *dot = strrchr(name, '.');
+    if (!dot || strcmp(dot, ".patch") != 0) {
+        return false;
+    }
+    size_t from_len = (size_t)(sep - name);
+    size_t to_len = (size_t)(dot - (sep + 4));
+    if (from_len == 0 || to_len == 0 || from_len >= from_sz || to_len >= to_sz) {
+        return false;
+    }
+    memcpy(from, name, from_len);
+    from[from_len] = '\0';
+    memcpy(to, sep + 4, to_len);
+    to[to_len] = '\0';
+    return true;
+}
+
+static bool verify_patch_header(const uint8_t *hdr, const char *url)
 {
     uint32_t magic = *(const uint32_t *)hdr;
     if (magic != PATCH_MAGIC) {
@@ -292,11 +322,34 @@ static bool verify_patch_header(const uint8_t *hdr)
         return false;
     }
 
-    if (memcmp(part_sha, hdr + 4, PATCH_DIGEST_SIZE) != 0) {
+    const uint8_t *patch_sha = hdr + 4;
+    if (memcmp(part_sha, patch_sha, PATCH_DIGEST_SIZE) != 0) {
         const esp_app_desc_t *app = esp_app_get_description();
-        ota_log("Patch not for this firmware (partition SHA256 mismatch)");
-        ota_log("Running %s — delta base must be that exact .bin (not an older release)",
-                app ? app->version : "?");
+        const char *ver = (app && app->version[0]) ? app->version : "?";
+
+        ota_log("REASON: delta base/version mismatch");
+        ota_log("Device running: %s", ver);
+        ota_log("Patch SHA does not match running partition SHA (wrong base image)");
+        ota_log("Device SHA: %02x%02x%02x%02x...  Patch expects: %02x%02x%02x%02x...",
+                part_sha[0], part_sha[1], part_sha[2], part_sha[3],
+                patch_sha[0], patch_sha[1], patch_sha[2], patch_sha[3]);
+
+        char from[64] = {0};
+        char to[64] = {0};
+        if (parse_delta_patch_versions(url, from, sizeof(from), to, sizeof(to))) {
+            ota_log("Patch filename: upgrade %s -> %s", from, to);
+            if (strcmp(from, ver) != 0) {
+                ota_log("Wrong base version: patch requires %s, device has %s", from, ver);
+            }
+            if (strcmp(to, ver) == 0) {
+                ota_log("Device is already at target %s -- this patch cannot be re-applied", to);
+            } else {
+                ota_log("Use patch built from exact .bin of %s, or use full .bin OTA", ver);
+            }
+        } else {
+            ota_log("Delta must be built from the exact .bin currently on device (%s)", ver);
+            ota_log("Rebuild: tools/make_patch.py --base <running.bin> --new <new.bin>");
+        }
         return false;
     }
 
@@ -437,7 +490,7 @@ static esp_err_t run_delta_ota(const char *url)
     if (err != ESP_OK) {
         goto cleanup;
     }
-    if (!verify_patch_header(patch_hdr)) {
+    if (!verify_patch_header(patch_hdr, url)) {
         err = ESP_ERR_INVALID_VERSION;
         goto cleanup;
     }
@@ -598,7 +651,11 @@ static void ota_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(3000));
         esp_restart();
     } else {
-        ota_log("FAILED: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_INVALID_VERSION) {
+            ota_log("FAILED: ESP_ERR_INVALID_VERSION -- delta patch base/version mismatch (see REASON above)");
+        } else {
+            ota_log("FAILED: %s", esp_err_to_name(err));
+        }
         s_state = OTA_STATE_FAILED;
         if (s_event_cb) {
             s_event_cb("{\"type\":\"ota_failed\"}");
