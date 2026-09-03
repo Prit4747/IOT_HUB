@@ -41,6 +41,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_app_format.h"
+#include "esp_app_desc.h"
 #include "esp_https_ota.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -292,8 +293,10 @@ static bool verify_patch_header(const uint8_t *hdr)
     }
 
     if (memcmp(part_sha, hdr + 4, PATCH_DIGEST_SIZE) != 0) {
+        const esp_app_desc_t *app = esp_app_get_description();
         ota_log("Patch not for this firmware (partition SHA256 mismatch)");
-        ota_log("Rebuild patch from the .bin currently on the device");
+        ota_log("Running %s — delta base must be that exact .bin (not an older release)",
+                app ? app->version : "?");
         return false;
     }
 
